@@ -1,0 +1,12 @@
+{
+  "name": "sitepack",
+  "version": "0.1.0",
+  "description": "Deploy-time packer for static web apps: ESM, CSS and workers into few hashed files.",
+  "type": "module",
+  "bin": { "sitepack": "bin/sitepack.mjs" },
+  "engines": { "node": ">=20" },
+  "files": ["bin", "src"],
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "dependencies": { "esbuild": "0.25.12" },
+  "license": "MIT"
+}
