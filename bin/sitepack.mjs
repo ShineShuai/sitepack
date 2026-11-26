@@ -7,12 +7,12 @@ import { loadConfig } from '../src/config.mjs';
 import { headerRules } from '../src/headers.mjs';
 
 const USAGE = `usage:
-  sitepack build   --in DIR --out DIR [--config FILE] [--manifest FILE]
-  sitepack compose --in DIR --out DIR [--layout NAME] [--packed-at MOUNT] [--unpacked-at MOUNT]
-                   [--config FILE] [--manifest FILE]
+  sitepack build   --in DIR --out DIR [--level N] [--config FILE] [--manifest FILE]
+  sitepack compose --in DIR --out DIR [--layout NAME] [--level N] [--packed-at MOUNT]
+                   [--unpacked-at MOUNT] [--config FILE] [--manifest FILE]
   sitepack check   DIR
   sitepack headers [--prefix /app/] [--config FILE]
-MOUNT: "/", "/name/" or "none".`;
+MOUNT: "/", "/name/" or "none". N: 0-4 or min, plain, commented, indexed, single.`;
 
 function parse(argv) {
   const options = {};
@@ -47,9 +47,21 @@ async function main() {
   const config = await loadConfig(options.config);
   const manifestPath = options.manifest ? resolve(options.manifest) : undefined;
   if (command === 'build') {
-    await build({ inDir: need(options, 'in'), outDir: need(options, 'out'), config, manifestPath, log });
+    const level = options.level;
+    await build({
+      inDir: need(options, 'in'),
+      outDir: need(options, 'out'),
+      config,
+      level,
+      manifestPath,
+      log,
+    });
   } else if (command === 'compose') {
-    const overrides = { packedAt: options['packed-at'], unpackedAt: options['unpacked-at'] };
+    const overrides = {
+      packedAt: options['packed-at'],
+      unpackedAt: options['unpacked-at'],
+      level: options.level,
+    };
     await compose({
       inDir: need(options, 'in'),
       outDir: need(options, 'out'),

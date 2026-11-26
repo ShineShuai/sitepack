@@ -1,6 +1,6 @@
 {
   "name": "sitepack",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Deploy-time packer for static web apps: ESM, CSS and workers into few hashed files.",
   "type": "module",
   "bin": { "sitepack": "bin/sitepack.mjs" },

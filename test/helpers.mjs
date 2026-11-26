@@ -26,7 +26,10 @@ export function site(files) {
 
 export async function snapshot(dir) {
   const entries = await Promise.all(
-    (await walk(dir)).map(async name => [name, (await readFile(join(dir, name))).toString('base64')]),
+    (await walk(dir)).map(async name => {
+      const data = await readFile(join(dir, name));
+      return [name, data.toString('base64')];
+    }),
   );
   return Object.fromEntries(entries);
 }

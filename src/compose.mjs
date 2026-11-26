@@ -21,7 +21,7 @@ export async function compose({ inDir, outDir, config, layoutName, overrides, ma
     }
     if (layout.packed) {
       const packed = join(tmp, 'packed');
-      await build({ inDir, outDir: packed, config, manifestPath, log });
+      await build({ inDir, outDir: packed, config, level: layout.level, manifestPath, log });
       sources.push([layout.packed, packed]);
     }
     await rm(outDir, { recursive: true, force: true });

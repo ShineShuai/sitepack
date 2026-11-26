@@ -21,7 +21,10 @@ export const cspMeta = tags =>
     /^content-security-policy$/i.test(attr(tag, 'http-equiv') ?? ''));
 
 function exists(path) {
-  return existsSync(path) && (!statSync(path).isDirectory() || existsSync(join(path, 'index.html')));
+  if (!existsSync(path)) {
+    return false;
+  }
+  return !statSync(path).isDirectory() || existsSync(join(path, 'index.html'));
 }
 
 // Problems of the site in `dir`: references that point nowhere, CSP hashes that do not match
