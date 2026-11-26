@@ -13,8 +13,9 @@ import { page, site, snapshot, temp } from './helpers.mjs';
 const INLINE = 'window.inline = 1;';
 const basic = () => site({
   'app/index.html': page({
-    head: `<meta http-equiv="Content-Security-Policy" content="script-src 'self' 'sha256-STALE'">\n` +
-      `<script>${INLINE}</script>\n<link rel="stylesheet" href="a.css">\n` +
+    head: `<meta http-equiv="Content-Security-Policy" ` +
+      `content="script-src 'self' 'sha256-STALE'">\n<script>${INLINE}</script>\n` +
+      '<link rel="stylesheet" href="a.css">\n' +
       '<link rel="stylesheet" href="b.css">',
     body: '<img src="logo.svg" alt=""><script type="module" src="main.js"></script>',
   }),
@@ -28,9 +29,9 @@ const basic = () => site({
   'app/logo.svg': '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h1"/></svg>',
 });
 
-async function run(inDir, over = {}, outDir = temp()) {
-  const config = resolveConfig({ pages: ['app/index.html'], ...over });
-  const result = await build({ inDir, outDir, config });
+async function run(inDir, over = {}, outDir = temp(), level = 0) {
+  const config = resolveConfig(over);
+  const result = await build({ inDir, outDir, config, level });
   return { ...result, outDir };
 }
 
@@ -79,7 +80,7 @@ const workerSite = (worker, extra = {}) => site({
   ...extra,
 });
 
-test('build: a worker and a css url are emitted first, so their names reach the referrer', async () => {
+test('build: a worker and a css url are emitted first; the referrer gets their names', async () => {
   const { outDir, pages } = await run(workerSite('self.onmessage = () => 1;\n'));
   const entry = pages['app/index.html'].scripts[0];
   const text = await readFile(join(outDir, 'app', entry), 'utf8');
@@ -100,7 +101,8 @@ test('build: a changed worker changes the name of the file that starts it', asyn
 
 const warned = () => site({
   'app/index.html': page({ body: '<script type="module" src="main.js"></script>' }),
-  'app/main.js': "export const o = { a: 1, a: 2 };\nconst e = new URL('./x.js', import.meta.url).href;\n" +
+  'app/main.js': 'export const o = { a: 1, a: 2 };\n' +
+    "const e = new URL('./x.js', import.meta.url).href;\n" +
     'export const load = () => import(e);\n',
   'app/x.js': 'export default 1;\n',
 });
@@ -115,7 +117,9 @@ test('build: warnings are listed; strict makes them fail', async () => {
 
 test('build: drop removes the prefixes; inlineMax 0 keeps images as files', async () => {
   const inDir = site({
-    'app/index.html': page({ body: '<img src="l.svg"><script type="module" src="src/m.js"></script>' }),
+    'app/index.html': page({
+      body: '<img src="l.svg"><script type="module" src="src/m.js"></script>',
+    }),
     'app/src/m.js': 'globalThis.q = 1;\n',
     'app/src/notes.md': 'doc',
     'app/l.svg': '<svg xmlns="http://www.w3.org/2000/svg"/>',
@@ -139,7 +143,9 @@ test('build: inline scripts can be minified, the CSP follows', async () => {
 });
 
 test('build: a missing script and an existing pack directory are errors', async () => {
-  const missing = site({ 'app/index.html': page({ body: '<script type="module" src="no.js"></script>' }) });
+  const missing = site({
+    'app/index.html': page({ body: '<script type="module" src="no.js"></script>' }),
+  });
   await assert.rejects(run(missing), /does not exist/);
   const clash = site({ 'app/index.html': page(), 'pack/x.txt': 'x' });
   await assert.rejects(run(clash), /pack\/ exists/);

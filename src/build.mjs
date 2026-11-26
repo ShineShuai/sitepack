@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { brotliCompressSync } from 'node:zlib';
 import { createAssets } from './assets.mjs';
+import { LEVELS, parseLevel } from './config.mjs';
 import { checkSite, cspMeta, inlineScripts } from './check.mjs';
 import { scriptHash, withScriptHashes } from './csp.mjs';
 import { applyEdits, attr, renderTag, scan, withAttr } from './html.mjs';
@@ -17,6 +18,9 @@ const IMAGE_TYPES = {
   '.gif': 'image/gif', '.webp': 'image/webp', '.avif': 'image/avif',
 };
 const PLAIN_LINK = new Set(['rel', 'href', 'type', 'crossorigin']);
+
+const scriptTag = (tag, href) =>
+  `${renderTag('script', withAttr(tag.attrs, 'src', href))}</script>`;
 
 function assertDisjoint(inDir, outDir) {
   if (isInside(outDir, inDir) || isInside(inDir, outDir)) {
@@ -108,8 +112,9 @@ async function inlineImage(tag, dir, max) {
   return renderTag('img', withAttr(tag.attrs, 'src', uri));
 }
 
-// Packs the site in `inDir` into `outDir`. -> { files, pages, warnings }.
-export async function build({ inDir, outDir, config, manifestPath, log = () => {} }) {
+// Packs the site in `inDir` into `outDir` at `level` (see LEVELS). -> { files, pages, warnings }.
+export async function build({ inDir, outDir, config, level = 0, manifestPath, log = () => {} }) {
+  const index = parseLevel(level);
   assertDisjoint(inDir, outDir);
   await rm(outDir, { recursive: true, force: true });
   await copyTree(inDir, outDir);
@@ -120,20 +125,21 @@ export async function build({ inDir, outDir, config, manifestPath, log = () => {
   await mkdir(packDir);
   const work = await mkdtemp(join(tmpdir(), 'sitepack-'));
   try {
-    return await run({ outDir, packDir, work, config, manifestPath, log });
+    return await run({ outDir, packDir, work, config, index, manifestPath, log });
   } finally {
     await rm(work, { recursive: true, force: true });
   }
 }
 
-async function run({ outDir, packDir, work, config, manifestPath, log }) {
+async function run({ outDir, packDir, work, config, index, manifestPath, log }) {
+  const preset = LEVELS[index];
   const consumed = new Set();
   const warnings = new Set();
-  const assets = createAssets({ esbuild, outDir, packDir, work, config, consumed, warnings });
+  const assets = createAssets({
+    esbuild, outDir, packDir, work, config, preset, consumed, warnings,
+  });
 
-  const names = config.pages === 'auto'
-    ? (await walk(outDir)).filter(name => name.endsWith('.html'))
-    : config.pages;
+  const names = (await walk(outDir)).filter(name => name.endsWith('.html'));
   const pages = [];
   for (const rel of names) {
     const abs = join(outDir, rel);
@@ -150,12 +156,28 @@ async function run({ outDir, packDir, work, config, manifestPath, log }) {
     pages.push({ rel, abs, dir: dirname(abs), html, tags, scripts, entries });
   }
 
-  const all = [...new Set(pages.flatMap(page => page.entries))];
+  // Level 4: every page gets one entry that imports its scripts in their order, built without
+  // splitting. Otherwise the entries of all pages are bundled together and share chunks.
+  const stemOf = page => page.rel.replace(/\.html$/, '').replaceAll('/', '-');
+  const merged = new Map();
+  const list = [];
+  if (preset.merge) {
+    for (const page of pages.filter(item => item.entries.length > 0)) {
+      const file = join(work, `${stemOf(page)}.entry.js`);
+      const imports = page.entries.map(entry => `import ${JSON.stringify(entry)};`);
+      await writeFile(file, `${imports.join('\n')}\n`);
+      merged.set(page.rel, file);
+      list.push({ abs: file, name: stemOf(page) });
+    }
+  } else {
+    const all = [...new Set(pages.flatMap(page => page.entries))];
+    const named = all.length > 0 ? entryNames(all) : new Map();
+    list.push(...all.map(abs => ({ abs, name: named.get(abs) })));
+  }
   const outputOf = new Map();
   let metafile = { outputs: {} };
-  if (all.length > 0) {
-    const named = entryNames(all);
-    metafile = await assets.bundleEntries(all.map(abs => ({ abs, name: named.get(abs) })));
+  if (list.length > 0) {
+    metafile = await assets.bundleEntries(list, { splitting: !preset.merge });
     for (const [key, output] of Object.entries(metafile.outputs)) {
       if (output.entryPoint) {
         outputOf.set(resolve(outDir, output.entryPoint), key);
@@ -164,24 +186,26 @@ async function run({ outDir, packDir, work, config, manifestPath, log }) {
   }
   const urlOf = (page, key) => relativeUrl(page.dir, resolve(outDir, key));
 
-  const manifest = { pages: {} };
+  const manifest = { level: index, levelName: preset.name, pages: {} };
   for (const page of pages) {
     const edits = [];
     const info = { scripts: [], styles: [], preload: [] };
-    for (const tag of page.scripts) {
-      const key = outputOf.get(resolve(page.dir, stripQuery(attr(tag, 'src'))));
-      info.scripts.push(urlOf(page, key));
-      edits.push({
-        start: tag.start,
-        end: tag.closeEnd,
-        text: `${renderTag('script', withAttr(tag.attrs, 'src', urlOf(page, key)))}</script>`,
-      });
-    }
-    const stem = page.rel.replace(/\.html$/, '').replaceAll('/', '-');
+    const isMerged = merged.has(page.rel);
+    const keyOf = tag => outputOf.get(resolve(page.dir, stripQuery(attr(tag, 'src'))));
+    const own = isMerged ? [outputOf.get(merged.get(page.rel))] : page.scripts.map(keyOf);
+    info.scripts.push(...new Set(own.map(key => urlOf(page, key))));
+    page.scripts.forEach((tag, position) => {
+      const keep = !isMerged || position === 0;
+      const href = urlOf(page, isMerged ? own[0] : own[position]);
+      const text = keep ? scriptTag(tag, href) : '';
+      edits.push({ start: tag.start, end: tag.closeEnd, text });
+    });
+    const stem = stemOf(page);
     const groups = stylesheetGroups(page.tags, page.dir);
     for (const [index, group] of groups.entries()) {
       const name = index === 0 ? stem : `${stem}-${index + 1}`;
-      const href = urlOf(page, `${toPosix(config.assetsDir)}/${await assets.bundleCss(group.files, name)}`);
+      const file = await assets.bundleCss(group.files, name);
+      const href = urlOf(page, `${toPosix(config.assetsDir)}/${file}`);
       info.styles.push(href);
       const [first, ...rest] = group.tags;
       edits.push({
@@ -198,7 +222,6 @@ async function run({ outDir, packDir, work, config, manifestPath, log }) {
       }
     }
     if (config.preload && page.scripts.length > 0) {
-      const own = page.scripts.map(tag => outputOf.get(resolve(page.dir, stripQuery(attr(tag, 'src')))));
       const chunks = [...staticClosure(metafile, own)].filter(key => !own.includes(key)).sort();
       info.preload = chunks.map(key => urlOf(page, key));
       const head = page.tags.find(tag => tag.name === 'head' && tag.closing);
@@ -262,7 +285,7 @@ async function run({ outDir, packDir, work, config, manifestPath, log }) {
   }
 
   manifest.files = {};
-  // A site without bundles has no pack directory: the empty one is removed with the other empty ones.
+  // A site without bundles has no pack directory: the empty one went with the empty ones.
   for (const name of existsSync(packDir) ? await walk(packDir) : []) {
     const data = await readFile(join(packDir, name));
     const isMap = name.endsWith('.map');
@@ -278,7 +301,8 @@ async function run({ outDir, packDir, work, config, manifestPath, log }) {
   const code = Object.entries(manifest.files).filter(([name]) => !name.endsWith('.map'));
   const bytes = code.reduce((sum, [, info]) => sum + info.bytes, 0);
   const brotli = code.reduce((sum, [, info]) => sum + info.brotli, 0);
-  log(`packed ${pages.length} pages into ${code.length} files: ${bytes} bytes, ${brotli} brotli`);
+  const summary = `${pages.length} pages, ${code.length} files, ${bytes} bytes, ${brotli} brotli`;
+  log(`level ${index} (${preset.name}): ${summary}`);
   for (const warning of warnings) {
     log(`warning: ${warning}`);
   }

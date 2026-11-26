@@ -1,15 +1,33 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { normalizeMount, resolveConfig, resolveLayout } from '../src/config.mjs';
+import {
+  LEVELS, normalizeMount, parseLevel, resolveConfig, resolveLayout,
+} from '../src/config.mjs';
 import { headerRules } from '../src/headers.mjs';
 
-test('config: unknown keys and bad values are errors', () => {
+test('config: unknown and removed keys, bad values', () => {
   assert.throws(() => resolveConfig({ pack: 1 }), /unknown key "pack"/);
+  for (const removed of ['pages', 'minify', 'sourcemap', 'level']) {
+    assert.throws(() => resolveConfig({ [removed]: 1 }), new RegExp(`unknown key "${removed}"`));
+  }
   assert.throws(() => resolveConfig({ csp: 'x' }), /csp must be one of/);
-  assert.throws(() => resolveConfig({ minify: 'yes' }), /minify must be true or false/);
+  assert.throws(() => resolveConfig({ strict: 'yes' }), /strict must be true or false/);
   assert.throws(() => resolveConfig({ assetsDir: '../x' }), /assetsDir/);
   assert.throws(() => resolveConfig({ drop: ['/abs'] }), /drop/);
   assert.equal(resolveConfig({ strict: true }).strict, true);
+});
+
+test('levels: numbers and names', () => {
+  assert.deepEqual(LEVELS.map(level => level.name),
+    ['min', 'plain', 'commented', 'indexed', 'single']);
+  assert.equal(parseLevel(undefined), 0);
+  assert.equal(parseLevel(3), 3);
+  assert.equal(parseLevel('2'), 2);
+  assert.equal(parseLevel('indexed'), 3);
+  assert.equal(parseLevel('single'), 4);
+  for (const bad of [5, -1, 1.5, 'x', '7', true]) {
+    assert.throws(() => parseLevel(bad), /is not a level \(0-4 or min, plain/);
+  }
 });
 
 test('mounts are normalised', () => {
@@ -22,17 +40,33 @@ test('mounts are normalised', () => {
   assert.throws(() => normalizeMount('/a b/'), /plain name/);
 });
 
-test('layouts: default, named, overrides, invalid', () => {
-  const config = resolveConfig({ layouts: { prod: { packed: '/' }, pages: { unpacked: '/', packed: '/p/' } } });
-  assert.deepEqual(resolveLayout(config), { unpacked: '/', packed: '/packed/' });
-  assert.deepEqual(resolveLayout(config, 'prod'), { unpacked: null, packed: '/' });
-  assert.deepEqual(resolveLayout(config, 'pages', { packedAt: 'x' }), { unpacked: '/', packed: '/x/' });
-  assert.deepEqual(resolveLayout(config, 'pages', { unpackedAt: 'none' }), { unpacked: null, packed: '/p/' });
-  assert.throws(() => resolveLayout(config, 'nope'), /unknown layout "nope" \(known: prod, pages\)/);
-  assert.throws(() => resolveLayout(config, 'pages', { packedAt: '/' }), /both variants are at \//);
-  assert.throws(() => resolveLayout(config, 'pages', { unpackedAt: '/a/', packedAt: '/a/b/' }), /nested/);
-  assert.throws(() => resolveLayout(config, 'pages', { unpackedAt: 'none', packedAt: 'none' }), /nothing/);
+test('layouts: default, named, level, overrides, invalid', () => {
+  const config = resolveConfig({
+    layouts: {
+      prod: { packed: '/' },
+      dev: { unpacked: '/', packed: '/p/', level: 'commented' },
+    },
+  });
+  assert.deepEqual(resolveLayout(config), { unpacked: '/', packed: '/packed/', level: 0 });
+  assert.deepEqual(resolveLayout(config, 'prod'), { unpacked: null, packed: '/', level: 0 });
+  assert.deepEqual(resolveLayout(config, 'dev'), { unpacked: '/', packed: '/p/', level: 2 });
+  assert.equal(resolveLayout(config, 'dev', { level: '4' }).level, 4);
+  assert.deepEqual(resolveLayout(config, 'dev', { packedAt: 'x' }),
+    { unpacked: '/', packed: '/x/', level: 2 });
+  assert.deepEqual(resolveLayout(config, 'dev', { unpackedAt: 'none' }),
+    { unpacked: null, packed: '/p/', level: 2 });
+  assert.throws(() => resolveLayout(config, 'nope'), /unknown layout "nope" \(known: prod, dev\)/);
+  assert.throws(() => resolveLayout(config, 'dev', { packedAt: '/' }), /both variants are at \//);
+  const nested = { unpackedAt: '/a/', packedAt: '/a/b/' };
+  assert.throws(() => resolveLayout(config, 'dev', nested), /nested/);
+  const none = { unpackedAt: 'none', packedAt: 'none' };
+  assert.throws(() => resolveLayout(config, 'dev', none), /nothing/);
+  assert.throws(() => resolveLayout(config, 'dev', { level: 9 }), /is not a level/);
   assert.throws(() => resolveConfig({ layouts: { x: {} } }), /publishes nothing/);
+  const typo = { layouts: { x: { packed: '/', lvl: 1 } } };
+  assert.throws(() => resolveConfig(typo), /unknown key "lvl"/);
+  const high = { layouts: { x: { packed: '/', level: 8 } } };
+  assert.throws(() => resolveConfig(high), /layout "x" level/);
 });
 
 test('headers: the immutable rule of the hashed folder', () => {

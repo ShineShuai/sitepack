@@ -1,14 +1,19 @@
 import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, extname, join, relative, resolve } from 'node:path';
-import { hashHex, walk } from './util.mjs';
+import { keepComments } from './comments.mjs';
+import { addToc } from './toc.mjs';
+import { hashHex, toPosix, walk } from './util.mjs';
 
 // Source patterns the packer understands. The source stays valid, native ES modules.
-const WORKER_URL =
-  /(new\s+(?:Shared)?Worker\(\s*new\s+URL\(\s*)(['"])(\.{1,2}\/[^'"]+)\2(\s*,\s*import\.meta\.url\s*\))/g;
+const BASE = /(\s*,\s*import\.meta\.url\s*\))/.source;
+const WORKER_URL = new RegExp(
+  /(new\s+(?:Shared)?Worker\(\s*new\s+URL\(\s*)(['"])(\.{1,2}\/[^'"]+)\2/.source + BASE,
+  'g',
+);
 const ASSET_EXT = 'css|svg|png|jpe?g|gif|webp|avif|woff2?|ttf|otf|wasm|mp3|ogg|wav';
 const ASSET_URL = new RegExp(
-  `(new\\s+URL\\(\\s*)(['"])(\\.{1,2}\\/[^'"]+\\.(?:${ASSET_EXT}))\\2(\\s*,\\s*import\\.meta\\.url\\s*\\))`,
+  /(new\s+URL\(\s*)(['"])/.source + `(\\.{1,2}\\/[^'"]+\\.(?:${ASSET_EXT}))\\2` + BASE,
   'g',
 );
 const LEFTOVER_URL = /new URL\(\s*(["'`])(\.{1,2}\/[^"'`]+)\1\s*,\s*import\.meta\.url/g;
@@ -29,42 +34,67 @@ const describe = warning => {
 };
 
 // Builds on top of esbuild. Everything lands flat in `packDir`, named `<name>-<content hash>`.
-// `consumed` collects the source files that went into some bundle, `warnings` the problems.
-export function createAssets({ esbuild, outDir, packDir, work, config, consumed, warnings }) {
+// `preset` is the level (see LEVELS). `consumed` collects the source files that went into some
+// bundle, `warnings` the problems.
+export function createAssets(context) {
+  const { esbuild, outDir, packDir, work, config, preset, consumed, warnings } = context;
   const emitted = new Map();
   let tmpCount = 0;
-  const sourcemap = config.sourcemap === 'external' ? 'external' : false;
 
   const common = () => ({
     absWorkingDir: outDir,
     bundle: true,
-    minify: config.minify,
+    minify: preset.minify,
     target: config.target,
     outdir: packDir,
     entryNames: '[name]-[hash]',
     chunkNames: '[name]-[hash]',
     assetNames: '[name]-[hash]',
-    legalComments: 'none',
+    legalComments: preset.comments ? 'inline' : 'eof',
+    sourcemap: preset.sourcemap ? 'external' : false,
     metafile: true,
+    write: false,
     logLevel: 'silent',
     define: DEFINE,
     loader: FILE_LOADERS,
   });
 
-  function record(result) {
+  // The hash in a name is of the code before the contents list is added; the list is a function
+  // of that code, so a name still stands for exactly one content.
+  async function write(result) {
+    for (const file of result.outputFiles) {
+      let contents = file.contents;
+      if (preset.toc && file.path.endsWith('.js')) {
+        const key = toPosix(relative(outDir, file.path));
+        const inputs = Object.keys(result.metafile.outputs[key]?.inputs ?? {});
+        contents = Buffer.from(addToc(file.text, inputs, `sitepack level ${preset.name}`));
+      }
+      await mkdir(dirname(file.path), { recursive: true });
+      await writeFile(file.path, contents);
+    }
+  }
+
+  async function record(result) {
     for (const input of Object.keys(result.metafile.inputs)) {
       consumed.add(resolve(outDir, input));
     }
     for (const warning of result.warnings) {
       warnings.add(describe(warning));
     }
+    await write(result);
   }
+
+  const entryOf = result => {
+    const [key] = Object.entries(result.metafile.outputs).find(([, out]) => out.entryPoint);
+    return basename(key);
+  };
 
   // A worker is built first, so that its final name is known when the file that starts it is
   // hashed: a changed worker then changes the name of its starter, never a stale copy in a cache.
   function emitScript(abs, chain) {
     if (chain.includes(abs)) {
-      throw new Error(`worker cycle: ${[...chain, abs].map(path => relative(outDir, path)).join(' -> ')}`);
+      const names = [...chain, abs].map(path => relative(outDir, path));
+      throw new Error(`worker cycle: ${names.join(' -> ')}`);
     }
     if (!emitted.has(abs)) {
       emitted.set(abs, (async () => {
@@ -72,12 +102,10 @@ export function createAssets({ esbuild, outDir, packDir, work, config, consumed,
           ...common(),
           entryPoints: [abs],
           format: 'esm',
-          sourcemap,
           plugins: [urlPlugin([...chain, abs])],
         });
-        record(result);
-        const [key] = Object.entries(result.metafile.outputs).find(([, out]) => out.entryPoint);
-        return basename(key);
+        await record(result);
+        return entryOf(result);
       })());
     }
     return emitted.get(abs);
@@ -120,20 +148,42 @@ export function createAssets({ esbuild, outDir, packDir, work, config, consumed,
     return text;
   }
 
+  async function withComments(source, path, loader) {
+    const kept = await keepComments(esbuild, source, loader);
+    if (!kept.kept) {
+      warnings.add(`${relative(outDir, path)}: comments not kept (that would change the code)`);
+    }
+    return kept.text;
+  }
+
   function urlPlugin(chain) {
     return {
-      name: 'sitepack-urls',
+      name: 'sitepack-js',
       setup(build) {
         build.onLoad({ filter: /\.[mc]?js$/ }, async ({ path }) => {
-          const source = await readFile(path, 'utf8');
-          if (!source.includes('import.meta.url')) {
-            return null;
+          const original = await readFile(path, 'utf8');
+          let text = original;
+          if (text.includes('import.meta.url')) {
+            text = await rewrite(text, path, chain);
           }
-          return { contents: await rewrite(source, path, chain), loader: 'js' };
+          if (preset.comments) {
+            text = await withComments(text, path, 'js');
+          }
+          return text === original ? null : { contents: text, loader: 'js' };
         });
       },
     };
   }
+
+  const cssPlugin = {
+    name: 'sitepack-css',
+    setup(build) {
+      build.onLoad({ filter: /\.css$/ }, async ({ path }) => ({
+        contents: await withComments(await readFile(path, 'utf8'), path, 'css'),
+        loader: 'css',
+      }));
+    },
+  };
 
   // The stylesheets `files` (absolute paths), in order, as one file. -> its name in packDir.
   async function bundleCss(files, name) {
@@ -145,23 +195,26 @@ export function createAssets({ esbuild, outDir, packDir, work, config, consumed,
       return `@import ${JSON.stringify(rel.startsWith('.') ? rel : `./${rel}`)};`;
     });
     await writeFile(entry, imports.join('\n'));
-    const result = await esbuild.build({ ...common(), entryPoints: [entry] });
-    record(result);
-    const [key] = Object.entries(result.metafile.outputs).find(([, out]) => out.entryPoint);
-    return basename(key);
+    const result = await esbuild.build({
+      ...common(),
+      entryPoints: [entry],
+      plugins: preset.comments ? [cssPlugin] : [],
+    });
+    await record(result);
+    return entryOf(result);
   }
 
-  // `entries`: [{ abs, name }]. -> the esbuild metafile.
-  async function bundleEntries(entries) {
+  // `entries`: [{ abs, name }]. `splitting` false: every entry is one self-contained file.
+  // -> the esbuild metafile.
+  async function bundleEntries(entries, { splitting = true } = {}) {
     const result = await esbuild.build({
       ...common(),
       entryPoints: entries.map(({ abs, name }) => ({ in: abs, out: name })),
       format: 'esm',
-      splitting: true,
-      sourcemap,
+      splitting,
       plugins: [urlPlugin([])],
     });
-    record(result);
+    await record(result);
     return result.metafile;
   }
 
